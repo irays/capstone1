@@ -1,0 +1,861 @@
+---
+title: "Movielens Capstone Project HarvardX"
+author: "MFR"
+date: "06/03/2020"
+output: pdf_document
+always_allow_html: true
+source_code: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+## File Name: HarvardX_Capstone1_June04_2020.RMD
+
+## Introduction:
+The first capstone project of the HarvardX Data Science Professional Certificate Series is a recommendation system on __MovieLens__.  A 10M MovieLens dataset was made available from GroupLens Research Lab to make the analysis. To apply the required machine learning algorithms the given movielens dataset was partitioned to create __edx__ and __validation__ sets. Two different  algorithms were used on the __edx__ set to predict movie ratings in the unknown __validation__ set to find the __RMSE__ for accuracy determination of the predictions. __Penalized Least Squares__ and __Matrix Factorization with Parallel Stochastic Gradient Descent (SGD)__ methods were used to find the RMSEs keeping the genres combined. __RMSEs__ were also calculated with genres separated in both methods. The __RMSE__ value with genres separated showed about 10% improvement over genres combined in the __MF-SGD__ method but no such change happened in the Penalized Least Squares method. Therefore, without proper consideration of genre, optimal RMSE cannot be obtained.        
+
+## Executive Summary: 
+Machine Learning methods and tools are required to analyze the dataset for data partitioning and the subsequent analysis. Historically, Machine Learning on movie recommendation systems became popular due to some of the methods used by the winners of the __Netflix__ challenges. The Netflix data is not publicly available, but a similar dataset was created by __GroupLens Research Lab__ for researchers and data scientists. A 10M dataset from __GroupLens__ was downloaded for the capstone project. An initial exploration of the 10M dataset was done with a set of quiz questions provided by edx. Once the dataset information and structure are known the subsequent analyses for finding the residual mean squared error (RMSE) became obvious. A proper choice of model or algorithm will result in the minimization of RMSE, and better predictability. A functional model with regularization does not ensure the reduction of the total variability due to various effects. The idea of regularization is to apply penalized regression to control the total variability of the movie and users effects on RMSE. Specifically, instead of minimizing the least square equation to find RMSE, we minimize an equation that adds a penalty to calculate the RMSE. However, from the analysis and results it was evident that modeling based on movie and user effects can’t be pushed below a certain limit. The plot indicates strong evidence of user, movie and genre to push the RMSE limit to its optimal limit. By applying the Matrix Factorization with Parallel Stochastic Gradient Descent (SGD) method an improvement of about 14% over the Penalized Least Squares was achieved. Also, within MF-SGD with genres separated showed about 10% improvement over the genres combined. The results have been presented in the result section. 
+
+## Preparing R Workspace environment by deleting files filled with data and values
+```{r, Preparing R Workspace, warning=FALSE,message=FALSE}
+
+rm(list=ls())
+#================================================================================#
+# A call to gc causes a garbage collection to take place.
+invisible(gc())
+#================================================================================#  
+```
+
+## Loading the required R libraries
+
+```{r, Loading R Libraries, warning=FALSE,message=FALSE}
+library(stringr)
+library(rvest)
+library(tidytext)
+library(wordcloud)
+library(doParallel)
+library(recosystem)
+library(RColorBrewer)
+library(plotly)
+library(ggthemes)
+library(data.table)
+library(kableExtra)
+library(Matrix.utils)
+library(DT)
+library(irlba)
+library(recommenderlab)
+library(tidyverse)
+library(lubridate)
+library(dplyr)
+library(knitr)
+library(kableExtra)
+library(dslabs)
+library(matrixStats)
+library(reticulate)
+```
+
+## Loading 10M Movielens Dataset and Partioning to Create edx and validation sets
+
+```{r, Loading 10M Movielens Dataset from grouplens.org, warning=FALSE,message=FALSE}
+#===================================================================#
+# Create edx set, validation set
+#===================================================================#
+# Note: this process could take a couple of minutes
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+
+set.seed(1, sample.kind="Rounding")
+# if using R 3.5 or earlier, use `set.seed(1)` instead
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+```
+
+## Data Exploration: 1. Cosine Similarity
+
+```{r, Data Exploration using cosine similarity, warning=FALSE,message=FALSE}
+
+edx2 <- edx
+
+edx2$userId <- as.factor(edx2$userId)
+edx2$movieId <- as.factor(edx2$movieId)
+
+# The output is a sparse matrix of class dgcMatrix.
+# Data needs to be converted using userId & movieId into numeric vectors.
+
+edx2$userId <- as.numeric(edx2$userId)
+edx2$movieId <- as.numeric(edx2$movieId)
+
+sparse_ratings <- sparseMatrix(i = edx2$userId,
+                               j = edx2$movieId ,
+                               x = edx2$rating, 
+                               dims = c(length(unique(edx2$userId)),
+                                        length(unique(edx2$movieId))),  
+                      dimnames = list(paste("u", 1:length(unique(edx2$userId)), sep = ""), 
+                      paste("m", 1:length(unique(edx2$movieId)), sep = "")))
+
+
+# Remove the edx.copy created
+rm(edx2)
+
+# Let's look at the first 10 users
+sparse_ratings[1:10,1:10]
+
+# Convert rating matrix into a recommenderlab sparse matrix
+ratingMat <- new("realRatingMatrix", data = sparse_ratings)
+ratingMat
+
+# Compute user similarity using the cosine similarity
+similarity_users <- similarity(ratingMat[1:50,], 
+                               method = "cosine", 
+                               which = "users")
+
+image(as.matrix(similarity_users), main = "User similarity")
+
+# Computing similarity between  movies using the cosine similarity.
+
+similarity_movies <- similarity(ratingMat[,1:50], 
+                                method = "cosine", 
+                                which = "items")
+
+image(as.matrix(similarity_movies), main = "Movies similarity")
+
+```
+
+## Data Exploration: 2. Dimension Reduction
+
+Dimensionality reduction techniques such as "pca" and "svd" are used to transform the original high-dimensional space into a lower-dimension. Dimension reduction using __Irlba__ package, which is a fast and memory-efficient to compute a partial SVD. 
+
+```{r, Data Exploration using Dimension Reduction, warning=FALSE,message=FALSE}
+set.seed(1)
+Y <- irlba(sparse_ratings,tol=1e-4,verbose=TRUE,nv = 100, maxit = 1000)
+
+# plot singular values
+
+plot(Y$d, pch=20, col = "green", cex = 1.5, xlab='Singular Value', ylab='Magnitude', 
+     main = "Singular Values for User-Movie Matrix")
+
+# calculate sum of squares of all singular values
+all_sing_sq <- sum(Y$d^2)
+
+# variability described by first 6, 12, and 20 singular values
+first_six <- sum(Y$d[1:6]^2)
+print(first_six/all_sing_sq)
+
+perc_vec <- NULL
+for (i in 1:length(Y$d)) {
+  perc_vec[i] <- sum(Y$d[1:i]^2) / all_sing_sq
+}
+
+plot(perc_vec, pch=20, col = "blue", cex = 1.5, xlab='Singular Value', ylab='% of Sum of Squares of Singular Values', main = "Choosing k for Dimensionality Reduction")
+lines(x = c(0,100), y = c(.90, .90))
+
+# To find the exact value of k, the length of the vector that remains from running sum of squares after excluding any items within that vector that exceed 0.90.
+
+k = length(perc_vec[perc_vec <= .90])
+k
+# Decomposition of Y ; matrices U, D, and V accordingly:
+
+U_k <- Y$u[, 1:k]
+dim(U_k)
+
+D_k <- Diagonal(x = Y$d[1:k])
+dim(D_k)
+
+V_k <- t(Y$v)[1:k, ]
+dim(V_k)
+```
+
+## Method-1: Penalized Least Squares with Regularization
+Creating test and train sets with caret package to assess the accuracy of the models. The Netflix challenge used the residual mean squared error (RMSE) metric to find the winner based on the  on a test set. The RMSE is then defined as:
+
+\begin{equation}
+RMSE = \sqrt{\frac{1}{N} \sum_{u,i} \left({{\hat y_{u,i}}-y_{u,i}}{} \right)^2}
+\end{equation}
+
+where $y_{u,i}$ as the rating for movie i by user u and denote our prediction with $\hat{y_{u,i}}$ and N is being the number of user/movie combinations and the sum occurring over all these combinations.
+
+In general movielens dataset was investigated with methods including but not limited to data cleaning by eliminating unwanted column and data visualization by creating tables and graphs of various formats. As mentioned earlier, two methods namely the Penalized Least Squares and Matrix Factorization with Parallel Stochastic Gradient Descent (SGD) have been applied to calculate the RMSE. Penalized least squares is a balanced data fitting technique that optimizes the variation and come up with a singular solution. A penalized least squares estimate is a surface that minimizes the penalized least squares over the class of all surfaces satisfying sufficient regularity conditions. However, the final result depends on the models that are being used not on the penalized least squares technique itself. So, a better RMSE from the penalized least squares will depend on the appropriate choices of the models. Specifically, instead of minimizing the least square equation, we minimize an equation that has a penalty term as shown in the following equation [1]:
+
+\begin{equation}
+\frac{1}{N} \sum_{u,i} \left({y_{u,i}-\mu-b_i}{} \right)^2  + {\lambda\sum_{i}{b_i^2}}
+\end{equation}
+
+The first term is the least squares and the second term is the penalty that gets larger when many $b_i$ are large. Using calculus we can actually show that the values of $b_i$ that minimize this equation are:
+
+\begin{equation}
+\hat{b_i}\left(\lambda\right) = \frac{1}{\lambda+n_i} \sum_{u=1}^{n_i}\left({Y_{u,i}-{\hat\mu}} \right)
+\end{equation}
+
+where $n_i$ is the number of ratings made for movie i.
+
+## A Linear model with average rating and different BIASES are used as Predictors:
+
+$$\hat Y = \mu + b_i + b_u + b_g + b_t$$ 
+$$\mu = Average~rating~of~all~movies$$ 
+$$b_i = Bias~based~on~Movies$$ 
+$$b_u = Bias~ based~ on~ Users$$ 
+$$b_g = Bias~ based~ on~ Genres$$ 
+$$b_t = Bias~ based~ on~ Date~ the~ movie~ is~ rated$$ 
+
+## A function that computes the RMSE for vectors of ratings and their corresponding predictors
+
+```{r, Linear Model, warning=FALSE,message=FALSE}
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+```
+
+## Average RMSE of Overall Ratings
+
+```{r, Overall ratings, warning=FALSE,message=FALSE}
+mu<-mean(edx$rating)
+
+# Compute the RMSE for the model and store it in a Dataframe	
+naive_rmse<-RMSE(validation$rating,mu)		
+RMSE_Results<-data_frame(method="Average RMSE of Overall Ratings", RMSE=naive_rmse)
+RMSE_Results
+```
+
+## RMSE with Movie Effect
+
+```{r,warning=FALSE,message=FALSE}
+movie_avgs <- edx %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))
+
+# Histogram of movie bias
+movie_avgs %>% qplot(b_i, geom ="histogram", bins = 10, data = ., color = I("black"))
+#=======================================================================#	
+# Improve the predicted value of mu with movies effect	
+#=======================================================================#
+pred_movie_effect <- validation %>% 
+  left_join(movie_avgs, by='movieId') %>% .$b_i		
+pred_movie_effect <- pred_movie_effect + mu		
+#===========================================================================#	
+# Compute the RMSE with movies effect model	
+#===========================================================================#		
+movie_effect<-RMSE(validation$rating,pred_movie_effect)		
+
+# Creating a results table with this naive approach:
+RMSE_Results<-bind_rows(RMSE_Results,data_frame(method="RMSE with Movie Effect",RMSE=movie_effect))		
+RMSE_Results
+```
+
+## RMSE with Movie + User Effects
+
+```{r, warning=FALSE,message=FALSE}
+edx %>% 
+  group_by(userId) %>% 
+  summarize(b_u = mean(rating)) %>% 
+  filter(n()>=100) %>%
+  ggplot(aes(b_u)) + 
+  geom_histogram(bins = 30, color = "black")
+
+user_avgs <- edx %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+pred_user_effect <- validation %>% 
+  left_join(movie_avgs, by='movieId') %>% 
+  left_join(user_avgs,by='userId') %>% 
+  mutate(pred = mu + b_i + b_u) %>% .$pred		
+
+user_effect <-RMSE(validation$rating,pred_user_effect)	
+
+# Compute the RMSE with movie + user effect	
+#=========================================================================#	
+	
+RMSE_Results<-bind_rows(RMSE_Results,data_frame(method="RMSE with Movie + User Effects", RMSE=user_effect))		
+```
+
+## RMSE with Movie + User + Genres Effects
+
+```{r, warning=FALSE,message=FALSE}
+edx %>% group_by(genres) %>%
+  summarize(n = n(), avg = mean(rating), se = sd(rating)/sqrt(n())) %>%
+  filter(n >= 30000) %>% 
+  mutate(genres = reorder(genres, avg)) %>%
+  ggplot(aes(x = genres, y = avg, ymin = avg - 2*se, ymax = avg + 2*se)) + 
+  geom_point() +
+  geom_errorbar() + theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Error bar plots by genres" , caption = "Genre analysis on edx dataset") 
+
+genre_avgs <-edx %>% 
+  left_join(movie_avgs,by="movieId") %>% 
+  left_join(user_avgs,by="userId")%>%group_by(genres) %>%	  
+  summarize(b_g = mean(rating - mu - b_i - b_u))
+
+pred_genre_effect <- validation %>% 
+  left_join(movie_avgs, by='movieId') %>% 	  
+  left_join(user_avgs,by='userId') %>% 
+  left_join(genre_avgs, by='genres') %>% 
+  mutate(pred_genre = mu + b_i + b_u + b_g) %>% .$pred_genre
+
+genre_effect <-RMSE(validation$rating,pred_genre_effect)	
+
+# Compute the RMSE with movie + user effect	+ genres
+RMSE_Results<-bind_rows(RMSE_Results,data_frame(method="RMSE with Movie + User + Genres Effects", RMSE=genre_effect))	
+RMSE_Results
+```
+
+## RMSE with Movie + User + Genres + Year Effect
+
+```{r, echo=FALSE}
+
+edx <- mutate(edx, date = as_datetime(timestamp))
+
+# Extracting the year rated
+edx <- mutate(edx, year_rated = year(as_datetime(timestamp)))
+head(edx)
+
+edx %>% 
+  mutate(date = round_date(as_datetime(timestamp), unit = "week")) %>%
+  group_by(date) %>%
+  summarize(rating = mean(rating)) %>%
+  ggplot(aes(date, rating)) +
+  geom_point() +
+  geom_smooth() +
+  ggtitle("Timestamp, week")+
+  labs(subtitle = "Average Ratings",
+       caption = "Data Analysis on edx dataset")
+
+#Extracting the title year
+title_year <- stringi::stri_extract(edx$title, regex = "(\\d{4})", comments = TRUE ) %>% as.numeric()
+
+#Add the title year
+edx_with_title_year <- edx %>% mutate(title_year = title_year)
+head(edx_with_title_year)
+
+#=====================================================================#
+
+# Drop the timestamp
+edx_with_title_year <- edx_with_title_year %>% select(-timestamp)
+
+head(edx_with_title_year)
+#=====================================================================#
+validation <- mutate(validation, date = as_datetime(timestamp))
+
+# Extracting the year rated
+validation <- mutate(validation, year_rated = year(as_datetime(timestamp)))
+head(validation)
+
+#Extracting the title year
+title_year <- stringi::stri_extract(validation$title, regex = "(\\d{4})", comments = TRUE ) %>% as.numeric()
+
+#Add the title year
+validation_with_title_year <- validation %>% mutate(title_year = title_year)
+head(validation_with_title_year)
+
+#==========================================================================#
+# Drop the timestamp
+validation_with_title_year <- validation_with_title_year %>% select(-timestamp)
+
+head(validation_with_title_year)
+#==========================================================================#
+edx_with_title_year %>% group_by(title_year) %>%	  
+  summarize(n = n(), avg = mean(rating), se = sd(rating)/sqrt(n())) %>%	  
+  filter(n >= 10000) %>% 	mutate(title_year = reorder(title_year, avg)) %>%	  
+  ggplot(aes(x = title_year, y = avg, ymin = avg - 2*se, ymax = avg + 2*se)) + 	  
+  geom_point() + geom_errorbar() + theme(axis.text.x = element_text(angle = 90, hjust = 1))	
+#===========================================================================#
+year_avgs<-edx_with_title_year %>% 
+  left_join(movie_avgs,by="movieId") %>% 
+  left_join(user_avgs,by="userId") %>% left_join(genre_avgs,by="genres") %>%	
+  group_by(title_year) %>%
+  summarize(b_t = mean(rating - mu - b_i - b_u - b_g))
+
+pred_year_effect <- validation_with_title_year %>% 
+  left_join(movie_avgs, by='movieId') %>% 	  
+  left_join(user_avgs,by='userId') %>% 
+  left_join(genre_avgs, by='genres') %>% 
+  left_join(year_avgs,by="title_year") %>%
+  mutate(pred_year = mu + b_i + b_u + b_g) %>% .$pred_year
+
+year_effect <-RMSE(validation_with_title_year$rating,pred_year_effect)	
+
+# Compute the RMSE with movie + user effect	+ genres + year effects
+
+RMSE_Results<-bind_rows(RMSE_Results,data_frame(method="RMSE with Movie + User + Genres + Year Effect", RMSE=year_effect))
+RMSE_Results
+```
+
+## RMSE with Regularized Movie Effect
+
+```{r, warning=FALSE,message=FALSE}
+validation_with_title_year  %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  mutate(residual = rating - (mu + b_i)) %>%
+  arrange(desc(abs(residual))) %>% 
+  select(title,  residual) %>% slice(1:10) 
+
+movie_titles <- edx_with_title_year %>% 
+  select(movieId, title) %>%
+  distinct()
+
+# Here are the 10 best movies according to our estimate:
+movie_avgs %>% left_join(movie_titles, by="movieId") %>%
+  arrange(desc(b_i)) %>% 
+  select(title, b_i) %>% 
+  slice(1:10) 
+
+# And here are the 10 worst:
+movie_avgs %>% left_join(movie_titles, by="movieId") %>%
+  arrange(b_i) %>% 
+  select(title, b_i) %>% 
+  slice(1:10) 
+
+#========================================================================#
+# Penalized Least Squares
+# Let's compute these regularized estimates of b_i using lambda = 3.
+
+lambda <- 3
+mu <- mean(edx_with_title_year$rating)
+movie_reg_avgs <- edx_with_title_year %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = sum(rating - mu)/(n()+lambda), n_i = n()) 
+
+# To see how the estimates shrink, let's make a plot of the regularized estimates versus 
+# the least squares estimates.
+data_frame(original = movie_avgs$b_i, 
+           regularlized = movie_reg_avgs$b_i, 
+           n = movie_reg_avgs$n_i) %>%
+  ggplot(aes(original, regularlized, size=sqrt(n))) + 
+  geom_point(shape=1, alpha=0.5)
+
+# Now, let's look at the top 10 best movies based on the penalized estimates  
+
+predicted_ratings <- validation_with_title_year %>% 
+  left_join(movie_reg_avgs, by = "movieId") %>%
+  mutate(pred = mu + b_i) %>% .$pred
+
+user_reg_effect <- RMSE(validation_with_title_year$rating,predicted_ratings)
+RMSE_Results <- bind_rows(RMSE_Results,
+                          data_frame(method="RMSE with Regularized Movie Effect",  
+                                     RMSE = user_reg_effect))
+RMSE_Results
+```
+
+## RMSE with Regularized Movie + User Effect
+
+```{r, warning=FALSE,message=FALSE}
+
+lambdas <- seq(0, 10, 0.25)
+
+mu <- mean(edx_with_title_year$rating)
+just_the_sum <- edx_with_title_year %>% 
+  group_by(movieId) %>% 
+  summarize(s = sum(rating - mu), n_i = n())
+
+rmses <- sapply(lambdas, function(l){
+  predicted_ratings <- validation_with_title_year %>% 
+    left_join(just_the_sum, by='movieId') %>% 
+    mutate(b_i = s/(n_i+l)) %>%
+    mutate(pred = mu + b_i) %>% .$pred
+  return(RMSE(validation_with_title_year$rating,predicted_ratings))
+})
+qplot(lambdas, rmses)  
+lambdas[which.min(rmses)]
+
+lambdas <- seq(0, 10, 0.25)
+
+rmses <- sapply(lambdas, function(l){
+  
+  mu <- mean(edx_with_title_year$rating)
+  
+  b_i <- edx_with_title_year %>% 
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+l))
+  
+  b_u <- edx_with_title_year %>% 
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+  
+  predicted_ratings <- 
+    validation_with_title_year %>% 
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = mu + b_i + b_u) %>% .$pred
+  
+  return(RMSE(validation_with_title_year$rating,predicted_ratings))
+})
+
+qplot(lambdas, rmses) 
+
+lambda <- lambdas[which.min(rmses)]
+lambda
+
+RMSE_Results <- bind_rows(RMSE_Results,
+                          data_frame(method="RMSE with Regularized Movie + User Effect",  
+                                     RMSE = min(rmses)))
+RMSE_Results
+```
+
+## Method-2: Matrix Factorization with SGD
+
+Matrix Factorization with Parallel Stochastic Gradient Descent (SGD) specifically that applies to Recommender System was used to verify and compare the RMSE with the penalized least squares technique [2]. Matrix Factorization with SGD has a recosystem package [3], and is a R wrapper of the LIBMF library developed by Yu-Chin Juan, Wei-Sheng Chin, Yong Zhuang, Bo-Wen Yuan, Meng-Yuan Yang, and Chih-Jen Lin [4]. LIBMF library is an open source library for recommender system using parallel matrix factorization. It is also a high-performance C++ library for large scale matrix factorization. LIBMF itself is a parallelized library, meaning that users can take advantage of multicore CPUs to speed up the computation. It also utilizes some advanced CPU features to further improve the performance. 
+
+Since recosystem is a wrapper of LIBMF, it inherits most of the features of LIBMF, and additionally provides a number of user-friendly R functions to simplify data processing and model building. Also, unlike most other R packages for statistical modeling that store the whole dataset and model object in memory, LIBMF (and hence recosystem) can significantly reduce memory use, for instance the constructed model that contains information for prediction can be stored in the hard disk, and output result can also be directly written into a file rather than be kept in memory. The main task of the recommender system is to predict unknown entries in the rating matrix based on observed values. Matrix factorization is known to be effective in recommender systems. As the input data set is often large, an MF solution is time-consuming. There are mainly three algorithms to solve MF namely coordinate gradient descent(CGD), alternate least square(ALS), and stochastic gradient descent(SGD). 
+
+In a recommendation system similar to Netflix or MovieLens dataset, there is a matrix containing users and a set of movies. Given that each users have rated some movies in the system, we would like to predict how the users would rate the movies that they have not yet rated, such that we can make recommendations to the users. As an example we can create a matrix with information about the existing ratings as shown in the table below. Assuming we have 5 users and 5 movies, and ratings are integers ranging from 0.5 to 5, with the "0" indicating that the user has not yet rated the movie.
+
+```{r comment=NA, Matrix, warning=FALSE,message=FALSE}
+rating <- matrix(c(1,"X",3,"X",5,4.5,2,5,1.5,3,2,5,2.5,"X",1,3.5,2,"X",5,2,4,1.5,4,2.5,4),ncol=5,byrow=TRUE)
+colnames(rating) <- c("M1","M2","M3","M4","M5")
+rownames(rating) <- c("U1","U2","U3","U4","U5")
+rating <- as.table(rating)
+rating
+```
+Therefore, the idea of predicting the missing ratings as indicated with "0" in the matrix would be consistent with the existing ratings in the matrix.
+
+The intuition with matrix factorization is to find the missing elements based on some hidden features such as title, actors, genres and other similar features that both the users prefer during rating a movie.
+
+The task of finding these hidden features can help us to predict a rating with respect to a certain user and a certain movie, because the features associated with the user should match with the features associated with the movie.
+
+Of course the underlying assumption is that the number of features would be smaller than the number of users and the number of movies to be rated. This assumtion is very much acceptable from a practical poiint of view since it is not reasonable to assume that each user is associated with a unique feature. In the given dataset we discovered that no_users = 69878, no_movies = 10677, no_titles = 10677, no_genres = 797, and no_ratings = 10. Actually, number of individual genres is only 20 but with various combinations it comes out to be 797 which is still a much smaller number than the no_users = 69878 and no_movies = 10677. 
+Based on what we discussed we can then design a matrix factorization method by assuming a set U of users, and a set of M movies. Let R of size |U|×|M| be the matrix that contains all the ratings that the users have assigned to the movies. Also, we assume that we would like to discover K latent features. Matrix Factorization Method consists of two matrices P (of size |U|×|K|) and Q (of size |M|×|K|) such that their product apprioximates |R| and is given in the equation below [5]:
+
+\begin{equation}
+\bf{R}\approx{P}\times{Q}^T = \hat R
+\end{equation}
+
+
+## Calculation Showing How R and $\hat{R}$ are Related to Matrices P and Q                 
+```{r,engine='python',warning=FALSE,message=FALSE}
+import numpy as np
+
+class MF():
+    
+    def __init__(self, R, K, alpha, beta, iterations):
+        """
+        Perform matrix factorization to predict empty
+        entries in a matrix.
+        
+        Arguments
+        - R (ndarray)   : user-item rating matrix
+        - K (int)       : number of latent dimensions
+        - alpha (float) : learning rate
+        - beta (float)  : regularization parameter
+        """
+        
+        self.R = R
+        self.num_users, self.num_items = R.shape
+        self.K = K
+        self.alpha = alpha
+        self.beta = beta
+        self.iterations = iterations
+
+    def train(self):
+        # Initialize user and item latent feature matrice
+        self.P = np.random.normal(scale=1./self.K, size=(self.num_users, self.K))
+        self.Q = np.random.normal(scale=1./self.K, size=(self.num_items, self.K))
+        
+        # Initialize the biases
+        self.b_u = np.zeros(self.num_users)
+        self.b_i = np.zeros(self.num_items)
+        self.b = np.mean(self.R[np.where(self.R != 0)])
+        
+        # Create a list of training samples
+        self.samples = [
+            (i, j, self.R[i, j])
+            for i in range(self.num_users)
+            for j in range(self.num_items)
+            if self.R[i, j] > 0
+        ]
+    
+        # Perform stochastic gradient descent for number of iterations
+        training_process = []
+        for i in range(self.iterations):
+            np.random.shuffle(self.samples)
+            self.sgd()
+            mse = self.mse()
+            training_process.append((i, mse))
+            if (i+1) % 10 == 0:
+                print("Iteration: %d ; error = %.4f" % (i+1, mse))
+        
+        return training_process
+    
+    def mse(self):
+        """
+        A function to compute the total mean square error
+        """
+        xs, ys = self.R.nonzero()
+        predicted = self.full_matrix()
+        error = 0
+        for x, y in zip(xs, ys):
+            error += pow(self.R[x, y] - predicted[x, y], 2)
+        return np.sqrt(error)
+
+    def sgd(self):
+        """
+        Perform stochastic graident descent
+        """
+        for i, j, r in self.samples:
+            # Computer prediction and error
+            prediction = self.get_rating(i, j)
+            e = (r - prediction)
+            
+            # Update biases
+            self.b_u[i] += self.alpha * (e - self.beta * self.b_u[i])
+            self.b_i[j] += self.alpha * (e - self.beta * self.b_i[j])
+            
+# Create copy of row of P since we need to update it but use older values for updateon Q
+            P_i = self.P[i, :][:]
+            
+            # Update user and item latent feature matrices
+            self.P[i, :] += self.alpha * (e * self.Q[j, :] - self.beta * self.P[i,:])
+            self.Q[j, :] += self.alpha * (e * P_i - self.beta * self.Q[j,:])
+
+    def get_rating(self, i, j):
+        """
+        Get the predicted rating of user i and item j
+        """
+        prediction = self.b + self.b_u[i] + self.b_i[j] + self.P[i, :].dot(self.Q[j, :].T)
+        return prediction
+    
+    def full_matrix(self):
+        """
+        Compute the full matrix using the resultant biases, P and Q
+        """
+        return mf.b + mf.b_u[:,np.newaxis] + mf.b_i[np.newaxis:,] + mf.P.dot(mf.Q.T)
+
+R = np.array([
+    [1.0, 0.0, 3.0, 0,5],
+    [4.5, 2.0, 5.0, 1.5,3.0],
+    [2.0, 5.0, 2.5,0.0, 1.0],
+    [3.5, 2.0, 0.0, 5.0,2.0],
+    [4.0, 1.5, 4.0,2.5, 4.0],])
+print("R")
+print(R)
+mf = MF(R, K=2, alpha=0.1, beta=0.01, iterations=50)
+training_process = mf.train()
+print()
+print("P")
+print(mf.P)
+print("Q")
+print(mf.Q)
+print("R_hat = P x Q")
+print(mf.full_matrix())
+print()
+print("Global bias:")
+print(mf.b)
+print()
+print("User bias:")
+print(mf.b_u)
+print()
+print("Item bias:")
+print(mf.b_i)
+
+x = [x for x, y in training_process]
+y = [y for x, y in training_process]
+
+```
+
+In the above equation each row of P represents the strength of the associations between a user and the features and each row of Q represents the strength of the associations between a movie and the features. To get the prediction of a rating of a movie $m_j$ by $u_i$, we can calculate the dot product of their vectors as given below:
+
+\begin{equation}
+\hat r_{ij} = p_{i}^T q_{j} = \sum_{k=1}^{K} p_{ik} q_{kj}
+\end{equation}
+
+We need to initialize two matrices P and Q with some values and then to calculate how different their product is from actual ratings matrix, R, by minimizing the difference iteratively. To further tune the result we will apply regularization to avoid overfitting.
+
+\begin{equation}
+e_{ij}^2 = (r_{ij}-\hat r_{ij})^2 = (r_{ij}-\sum_{k=1}^{K}p_{ik}q_{kj})^2
+\end{equation}
+
+To minimize the error, we differentiate the above equation with respect ot $p_{ik}$ and $q_{kj}$. 
+
+\begin{equation}
+\frac{\partial {e_{ij}^2}}{\partial p_{ik}} = -2(r_{ij}-\hat r_{ij})(q_{kj}) = -2e_{ij}q_{kj}
+\end{equation}
+
+\begin{equation}
+\frac{\partial {e_{ij}^2}}{\partial q_{ik}} = -2(r_{ij}-\hat r_{ij})(p_{ik}) = -2e_{ij}p_{ik}
+\end{equation}
+
+The updated values of both $p_{ik}$ and $q_{kj}$ are then calculated by the following equations:
+
+\begin{equation}
+p'_{ik} = p_{ik} + \alpha\frac{\partial {e_{ij}^2}}{\partial p_{ik}} = p_{ik} + 2\alpha{e_{ij}q_{kj}}
+\end{equation}
+
+\begin{equation}
+q'_{ik} = q_{kj} + \alpha\frac{\partial{e_{ij}^2}}{\partial q_{kj}} = q_{kj} + 2\alpha{e_{ij}p_{ik}}
+\end{equation}
+
+In the above equations $\alpha$ is a constant whose value determines the rate of approaching the minimum. Normally, $\alpha$ is considered small so that we don't skip the minimum and end up oscillating around the minimum.
+
+We can check the overall error as calculated using the following equation and determine when we should stop the process. We are not really trying to come up with P and Q such that we can reproduce R exactly. Instead, we will only try to minimize the errors of the observed user-movie pairs. Considering T be a set of tuples, each of which is in the form of $(u_i,d_j,r_{ij})$, such that T contains all the observed user-movie pairs together with the associated ratings, we are only trying to minimise every $e_{ij}$ for $(u_i,d_j,r_{ij}) \in T$. 
+
+T is our training dataset. As for the rest of the unknowns, we will be able to determine their values once the associations between the users, movies and features have been learnt. 
+
+Using the above update rules, we can then iteratively perform the operation until the error converges to its minimum. We can check the overall error as calculated using the following equation and determine when we should stop the process.
+
+\begin{equation}
+e = \sum_{(u_{i},d_{j},r_{ij})\in_T}e_{ij} = \sum_{(u_{i},d_{j},r_{ij})\in_T} (r_{ij}-\sum_{k=1}^{K}{p_{ik}}{q_{kj}})^2
+\end{equation}
+
+A common extension to this basic algorithm is to introduce regularization to avoid overfitting. This is done by adding a parameter and modify the squared error as follows:
+
+\begin{equation}
+e_{ij}^2 = (r_{ij}-\hat r_{ij})^2 = (r_{ij}-\sum_{k=1}^{K}{p_{ik}}{q_{kj}})^2
++ \frac{\beta}{2}\sum_{k=1}^{K}(||P||^2-||Q||^2)
+\end{equation}
+
+In other words, the new parameter $\beta$ is used to control the magnitudes of the user-feature and movie-feature vectors such that P and Q would give a good approximation of R without having to contain large numbers. In practice, $\beta$ is set to some values in the order of 0.02. The new update rules for this squared error can be obtained by a procedure similar to the one described above. The new update equaions are as follows:
+
+\begin{equation}
+p'_{ik} = p_{ik} + \alpha\frac{\partial {e_{ij}^2}}{\partial p_{ik}} = p_{ik} + \alpha(2{e_{ij}q_{jk}-\beta{p_{ik}})}
+\end{equation}
+
+\begin{equation}
+q'_{ik} = q_{kj} + \alpha\frac{\partial{e_{ij}^2}}{\partial q_{kj}} = q_{kj} + \alpha(2{e_{ij}p_{ik}-\beta{q_{kj}})}
+\end{equation}
+
+A rating is being generated, with some biases to the ratings. Hence, we can also add biases in order to better model how a rating is being generated using the following model:
+
+\begin{equation}
+\hat{r_{ij}} = b+bu_{i}+bd_{j}+\sum_{k=1}^{K}{p_{ik}}{q_{kj}}
+\end{equation}
+
+where b is the global bias (which can be easily estimated by using the mean of all ratings), $bu_i$ is the bias of $user_i$, and $bd_j$ is te bias of movie j.we can derive the update rules for the user biases and movie biases easily:
+
+\begin{equation}
+bu'_{i}=bu_{i}+\alpha (e_{ij}-\beta bu_{i})
+\end{equation}
+
+\begin{equation}
+bd'_{j}=bd_{j}+\alpha(e_{ij}-\beta bd_{j})
+\end{equation}
+
+In practice, the process of factorization will converge faster if biases are included in the model.
+
+## RMSE using Matrix Factorization with Stochastic Gradient Descent (SGD)
+The usage of 'recosystem' package is really straightforward. Here the training_dataset 
+variable represents a dataframe with userid, movieid, rating columns. Parameters are set arbitrarily: the number of factors (dim) is 30, regularization for P and Q factors (costp_l2, costq_l2) is set to 0.001, and convergence can be controlled by a number of 
+iterations (niter = 10) and learning rate (lrate = 0.1). The user can also control the parallelization using the nthread = 6 parameter:
+
+Mean squared error (abbreviated MSE) and root mean square error (RMSE) refer to the 
+amount by which the values predicted by an estimator differ from the quantities being estimated (typically outside the sample from which the model was estimated).
+
+We calculate the standard deviation of the residuals (prediction errors) RMSE. Between the predicted ratings and the real ratings . If one or more predictors are significant, the second step is to assess how well the model fits the data by inspecting the Residuals Standard Error (RSE).
+
+```{r, MF with SGD, warning=FALSE,message=FALSE}
+
+# A call to gc causes a garbage collection to take place.
+invisible(gc())
+#====================================================================================#
+edx_new <- edx_with_title_year %>% select(-c("genres","title","date","year_rated","title_year"))
+
+edx_new <- edx_with_title_year %>% select(movieId, userId, rating)
+validation_new <- validation_with_title_year %>% select(-c("genres","title","date","year_rated","title_year"))
+
+validation_new <- validation_with_title_year %>% select(movieId, userId, rating)
+
+edx_matrix <- as.matrix(edx_new)
+dim(edx_matrix)
+validation_matrix <- as.matrix(validation_new)
+dim(validation_matrix)
+write.table(edx_matrix, file = "trainingset.txt", sep = " ", row.names = FALSE, 
+            col.names = FALSE)
+
+write.table(validation_matrix, file = "validationset.txt", sep = " ", 
+            row.names = FALSE, col.names = FALSE)
+
+#  data_file(): Specifies a data set from a file in the hard disk. 
+
+set.seed(1)
+training_dataset <- data_file("trainingset.txt")
+
+validation_dataset <- data_file("validationset.txt")
+
+recommender = Reco()
+
+# Matrix Factorization :  tuning training set
+
+opts <- recommender$tune(training_dataset, opts = list(dim = c(10, 20, 30), lrate = c(0.1, 0.2),
+                                     costp_l1 = 0, costq_l1 = 0,
+                                     nthread = 1, niter = 10))
+
+# Model training 
+recommender$train(training_dataset, opts = c(opts$min , nthread = 1, niter = 50,verbose=FALSE))
+
+pred_file = tempfile()
+
+recommender$predict(validation_dataset, out_file(pred_file))
+
+real_ratings <- read.table("validationset.txt", header = FALSE, sep = " ")$V3
+
+pred_ratings <- scan(pred_file)
+dim(as.matrix(pred_ratings))
+
+# mf_pred <- data.frame(real_ratings[1:20], pred_ratings[1:20])
+# kable(head(mf_pred,20), format = "pandoc", caption = "Top twenty rows of edx dataset")
+RMSE_MF <- RMSE(real_ratings, pred_ratings)
+
+RMSE_Results <- bind_rows(RMSE_Results,
+                          data_frame(method="MF with SGD",  
+                                     RMSE = RMSE_MF))
+
+kable(RMSE_Results, format = "rst", row.names = FALSE)
+RMSE_Results %>% mutate(name = reorder(method, desc(RMSE))) %>% 
+  ggplot(aes(x = method, y = RMSE, fill = RMSE)) +
+  geom_bar(stat = "identity") + coord_flip() + scale_fill_distiller(palette = "PiYG") + 
+  ggtitle("RMSE RESULTS")
+
+```
+
+## Results & Discussions
+
+In analyzing the movielens dataset I observed that RMSE limit can be pushed down to an optimal limit with a model involving movie, user and genres. A good model must need to consider the effect of genre for reaching the optimal RMSE. However, one immediate problem I encountered with my Dell Laptop (about 9 years old, Intel i7 processor with 2.00 GHz clock speed, recently being updated to with 16 GB RAM) is that it cannot handle training and test datasets involving movieId, userId, rating and genres simultaneously. Even with movieId, userId and rating, computation time is more than an hour with Matrix Factorization with Parallel Stochastic Gradient Descent (SGD) method. In order to observe the effect of genre on movie rating I separated the genres. In this regard first I extract the title year and mutate it as a separate column from the title itself, then in the second step I dropped the timestamp and in the third step I separated the genres and replaced the original column with genres separated. The modified edx dataset with genres separated will create matrix which is very large, about 2.6 times bigger than the edx dataset. This is because user and movie are related to individual genres in many more combinations than the genres combined. These matrices having dimensions with (25967194,3) and (999999,3) for training set and validation set respectively. Considering these newly created sets I ran both the methods. In the Penalized method with genres separated and genres combined are 0.865 and 0.865 respectively which are same. In the Penalized method these results are as expected. In order to see any tangible effect of genres in Penalized method data modeling has to be carried out with a modified model. In the Matrix Factorization with SGD the results With genres combined is 0.781 and genres separated the RMSE is about 0.686. The effect of separating the genres made about 10% improvement over the genres combined in the MF with SGD. Matrix Factorization with Parallel Stochastic Gradient Descent (SGD) showed an improvement of about 15% over the Penalized Least Squares. However, computational time in the MF SGD method with genres separated is not presented in this report due to its extremely high computational time. One thing is very much evident  that without proper consideration of genres in our analysis we cannot find the optimal RMSE in either penalized regression method or with Parallel Stochastic Gradient Descent SGD method.  
+
+## Acknowledgements:
+
+My RMSE results are purely based on known algorithms namely Penalized Least Squares and Matrix Factorization with Stochastic Gradient Descent (SGD) methods. To me learning the existing algorithms are important and it is vital to come up with a better algorithm in the near future. Of course my sources of knowledge on Data Science are the online dsbook by Prof. Irizarry, online sources including but not limited to RPubs, DataCamp, Kaggle, GitHub, etc. So, I must duly acknowledge Prof. Rafael A. Irizarry for putting together an online Data Science professional package for us to learn remotely from the different parts of the world. Of course I am grateful to the edx support group for their relentless effort to keep many of us connected with the uninterrupted and fully functional IT support and logistics for playing the videos and running the codes. As I mentioned earlier that I started this program without even knowing the name of programming language called R. My self-confidence was boosted once I finished all eight courses within a short span of time. I am thankful to my peers through discussion forum of edx for their positive and valuable discussions and dialogues that really helped me in solving various R problems and related assignments. Finally I look forward to team up with peers and partners to continue with Machine Learning in R and Python for useful applications in the near future.
+
+## References:
+## 1. https://rafalab.github.io/dsbook/ 
+## 2. https://rafalab.github.io/dsbook/matrix-factorization.html 
+## 3. https://github.com/yixuan/recosystem
+## 4. http://www.csie.ntu.edu.tw/~cjlin/libmf/
+## 5. http://www.albertauyeung.com/post/python-matrix-factorization/
+
+
